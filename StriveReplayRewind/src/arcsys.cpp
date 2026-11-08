@@ -175,6 +175,12 @@ bool asw_rollback::slot_set(int index) const {
   return *reinterpret_cast<const bool *>(slots + index * SLOT_SIZE);
 }
 
+void asw_rollback::set_slot_flag(int index, bool set) {
+  auto *slots = *reinterpret_cast<char **>(reinterpret_cast<char *>(this) + 0x10);
+  if (!slots || index < 0 || index >= MaxBackupFrame) return;
+  *reinterpret_cast<bool *>(slots + index * SLOT_SIZE) = set;
+}
+
 replay_peer *replay_peer::get(int index) {
   if (!replay_read_heads || index < 0 || index >= COUNT) return nullptr;
   // ReadHead is at +0x8 inside the peer

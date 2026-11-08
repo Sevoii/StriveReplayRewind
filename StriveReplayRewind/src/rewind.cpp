@@ -4,52 +4,38 @@
 #include <UnrealDef.hpp>
 
 #include <algorithm>
+#include <chrono>
 
 using RC::Output::send;
 namespace LogLevel = RC::LogLevel;
 
-/* Ring */
+/* Slots */
 
-bool ReplayRewind::Ring::create(int slots) {
-  instance = asw_rollback::create_owned(slots);
-  if (!instance) return false;
-  size = slots;
-  meta = new FrameMeta[slots];
-  return true;
-}
-
-void ReplayRewind::Ring::destroy() {
-  asw_rollback::destroy_owned(instance);
-  instance = nullptr;
-  delete[] meta;
-  meta = nullptr;
-  size = 0;
-}
-
-void ReplayRewind::Ring::invalidate() {
-  for (int i = 0; i < size; ++i) meta[i].valid = false;
-}
-
-bool ReplayRewind::Ring::save(const FrameMeta &m) {
+bool ReplayRewind::saveSlot(int slot, const FrameMeta &m) {
+  // SaveBackup writes slot (Current + 1) % Max
+  int before = (slot + SLOTS - 1) % SLOTS; // non-const: FIELD setters take T&
+  store->CurrentBackupDataIndex = before;
   // SaveBackup has a per-tick save cap that the engine only resets on the network path; keep it from latching
-  instance->InputSameFrames = 0;
-  instance->HalfFrames = 0;
-  instance->SavedFrameCountThisFrame = 0;
-  instance->bSaveLimitReached = false;
-  instance->save_backup();
+  store->InputSameFrames = 0;
+  store->HalfFrames = 0;
+  store->SavedFrameCountThisFrame = 0;
+  store->bSaveLimitReached = false;
+  store->save_backup();
 
-  const int index = current();
-  if (!instance->slot_set(index)) return false;
-  meta[index] = m;
-  meta[index].valid = true;
+  if (store->CurrentBackupDataIndex != slot || !store->slot_set(slot)) return false;
+  meta[slot] = m;
+  meta[slot].valid = true;
   return true;
 }
 
-bool ReplayRewind::Ring::restore(int k, int frames_back) {
-  const int target = indexBack(k);
-  int newer[64];
-  const int newer_count = (std::min)(k, 64);
-  for (int j = 0; j < newer_count; ++j) newer[j] = indexBack(j);
+bool ReplayRewind::restoreSlot(int slot, int frames_back) {
+  // Rollback() restores slot Current - RollbackFrame and clears bSet on every slot after it up to Current. Point
+  // Current at the slot right after the target with RollbackFrame 1, so only that one flag is touched, and put it
+  // back afterwards (the data itself is only read).
+  const int next = (slot + 1) % SLOTS;
+  const bool next_set = store->slot_set(next);
+  int current = next; // non-const: FIELD setters take T&
+  store->CurrentBackupDataIndex = current;
 
   // PreRollBack/PostRollBack read the GAME's RollbackFrame to age particles/audio and to decide which effect pawns
   // were spawned inside the rolled-back window. Offline it is 0, which leaves effects from after the target attached
@@ -59,12 +45,13 @@ bool ReplayRewind::Ring::restore(int k, int frames_back) {
   int game_rollback_frame = game ? game->RollbackFrame : 0; // non-const: FIELD setters take T&
   if (game) game->RollbackFrame = frames_back;
 
-  instance->RollbackFrame = k; // Rollback() restores slot Current - RollbackFrame
-  instance->IsRollBackFinish = false;
-  const bool ok = instance->rollback();
-  instance->RollbackFrame = 0;
-  instance->RemainingFastForwardFrames = 0;
-  instance->IsRollBackFinish = false;
+  store->RollbackFrame = 1;
+  store->IsRollBackFinish = false;
+  const bool ok = store->rollback();
+  store->RollbackFrame = 0;
+  store->RemainingFastForwardFrames = 0;
+  store->IsRollBackFinish = false;
+  store->set_slot_flag(next, next_set);
 
   if (game) {
     game->RollbackFrame = game_rollback_frame;
@@ -74,26 +61,25 @@ bool ReplayRewind::Ring::restore(int k, int frames_back) {
     game->clear_pawn_cache();
   }
 
-  if (!ok || current() != target) return false;
-  for (int j = 0; j < newer_count; ++j) meta[newer[j]].valid = false; // Rollback() unset those slots
-  return true;
+  return ok && store->CurrentBackupDataIndex == slot;
 }
 
 /* ReplayRewind */
 
 void ReplayRewind::reset() {
-  dense.destroy();
-  sparse.destroy();
+  asw_rollback::destroy_owned(store);
+  store = nullptr;
   owner = nullptr;
-  last_frame = -1;
+  invalidate();
 }
 
 void ReplayRewind::invalidate() {
-  if (dense.instance) dense.invalidate();
-  if (sparse.instance) sparse.invalidate();
+  for (auto &m : meta) m.valid = false;
+  key_head = KEYFRAMES - 1;
+  key_count = 0;
   last_frame = -1;
-  forward_remaining = 0;
   forward_target = -1;
+  forward_stalls = 0;
 }
 
 void ReplayRewind::disable(const wchar_t *reason) {
@@ -102,38 +88,40 @@ void ReplayRewind::disable(const wchar_t *reason) {
   reset();
 }
 
-bool ReplayRewind::ensureInstances(AREDGameState_Battle *GameState) {
-  // buffer sizes come from this battle's object manager; a new battle means new buffers
+bool ReplayRewind::ensureInstance(AREDGameState_Battle *GameState) {
+  // buffer sizes come from this battle's object manager; a new battle means a new buffer
   if (owner && owner != GameState) reset();
   if (owner) return true;
   if (disabled || !asw_rollback::owned_available() || !replay_peer::get(0)) return false;
 
-  if (!dense.create(DENSE_FRAMES) || !sparse.create(SPARSE_SLOTS)) {
-    disable(STR("could not create rollback managers"));
+  store = asw_rollback::create_owned(SLOTS);
+  if (!store) {
+    disable(STR("could not create rollback manager"));
     return false;
   }
-  for (auto *ring : {&dense, &sparse}) {
-    auto *inst = ring->instance;
-    // sanity check the constructor did what the source says before trusting the layout
-    if (inst->MaxBackupFrame != ring->size || inst->ObjVectorBufferSize == 0 || inst->CharVectorBufferSize == 0) {
-      send<LogLevel::Warning>(STR("[rewind] unexpected manager layout: max {} obj {} char {}\n"), inst->MaxBackupFrame,
-                              inst->ObjVectorBufferSize, inst->CharVectorBufferSize);
-      disable(STR("rollback manager layout mismatch"));
-      return false;
-    }
+  // sanity check the constructor did what the source says before trusting the layout
+  if (store->MaxBackupFrame != SLOTS || store->ObjVectorBufferSize == 0 || store->CharVectorBufferSize == 0) {
+    send<LogLevel::Warning>(STR("[rewind] unexpected manager layout: max {} obj {} char {}\n"), store->MaxBackupFrame,
+                            store->ObjVectorBufferSize, store->CharVectorBufferSize);
+    disable(STR("rollback manager layout mismatch"));
+    return false;
   }
   owner = GameState;
-  last_frame = -1;
+  invalidate();
 
-  const auto per_slot = asw_rollback::SLOT_SIZE + 0x1848 + dense.instance->ObjVectorBufferSize + dense.instance->CharVectorBufferSize;
-  send<LogLevel::Verbose>(STR("[rewind] managers created: {} dense + {} sparse slots, ~{} KB per slot, ~{} MB total\n"),
-                          DENSE_FRAMES, SPARSE_SLOTS, per_slot / 1024, per_slot * (DENSE_FRAMES + SPARSE_SLOTS) / (1024 * 1024));
+  const auto per_slot = asw_rollback::SLOT_SIZE + 0x1848 + store->ObjVectorBufferSize + store->CharVectorBufferSize;
+  send<LogLevel::Verbose>(STR("[rewind] manager created: {} slots (round start + {} keyframes), ~{} KB per slot, ~{} MB total\n"),
+                          SLOTS, KEYFRAMES, per_slot / 1024, per_slot * SLOTS / (1024 * 1024));
   return true;
+}
+
+int ReplayRewind::newestSavedFrame() const {
+  return key_count > 0 ? meta[keySlot(0)].game_frame : meta[START_SLOT].game_frame;
 }
 
 void ReplayRewind::afterUpdate(AREDGameState_Battle *GameState) {
   auto *engine = asw_engine::get();
-  if (!engine || !ensureInstances(GameState)) return;
+  if (!engine || !ensureInstance(GameState)) return;
 
   const int frame = engine->GameFrame;
   if (frame == last_frame) return;      // paused / nothing simulated
@@ -142,19 +130,18 @@ void ReplayRewind::afterUpdate(AREDGameState_Battle *GameState) {
   FrameMeta next;
   next.game_frame = frame;
   int reading = 0;
-  const auto &prev = dense.meta[dense.current()];
   for (int i = 0; i < replay_peer::COUNT; ++i) {
     const auto *peer = replay_peer::get(i);
     next.heads[i] = peer->ReadHead;
     if (!peer->is_reading()) continue;
     ++reading;
     // unused team slots sit in read mode without advancing; only check streams that move
-    if (prev.valid && mismatch_logs < 20) {
-      const int moved = static_cast<int>(next.heads[i].solid_position - prev.heads[i].solid_position);
-      if (moved != 0 && moved != frame - prev.game_frame) {
+    if (last_frame >= 0 && mismatch_logs < 20) {
+      const int moved = static_cast<int>(next.heads[i].solid_position - last_heads[i].solid_position);
+      if (moved != 0 && moved != frame - last_frame) {
         ++mismatch_logs;
         send<LogLevel::Warning>(STR("[rewind] peer {} read head moved {} over {} frames (frame {})\n"), i, moved,
-                                frame - prev.game_frame, frame);
+                                frame - last_frame, frame);
       }
     }
   }
@@ -163,154 +150,146 @@ void ReplayRewind::afterUpdate(AREDGameState_Battle *GameState) {
     return;
   }
 
-  // while jumping forward, only the last DENSE_FRAMES frames can end up in the dense ring anyway
-  const bool skip_dense = forward_target >= 0 && frame < forward_target - DENSE_FRAMES;
-  if (forward_target >= 0 && frame >= forward_target) forward_target = -1;
-  if (!skip_dense && !dense.save(next)) {
+  // the first frame seen in a round is its start; after that a keyframe every KEYFRAME_INTERVAL, also while seeking
+  bool ok = true;
+  if (!meta[START_SLOT].valid) {
+    ok = saveSlot(START_SLOT, next);
+  } else if (frame - newestSavedFrame() >= KEYFRAME_INTERVAL) {
+    const int head = (key_head + 1) % KEYFRAMES;
+    ok = saveSlot(1 + head, next);
+    if (ok) {
+      key_head = head;
+      if (key_count < KEYFRAMES) ++key_count;
+    }
+  }
+  if (!ok) {
     disable(STR("SaveBackup did not fill its slot"));
     return;
   }
-  const auto &key = sparse.meta[sparse.current()];
-  if (!key.valid || frame - key.game_frame >= SPARSE_INTERVAL) {
-    if (!sparse.save(next)) {
-      disable(STR("SaveBackup did not fill its slot"));
-      return;
-    }
-  }
+
+  for (int i = 0; i < replay_peer::COUNT; ++i) last_heads[i] = next.heads[i];
   last_frame = frame;
+  if (forward_target >= 0 && frame >= forward_target) forward_target = -1;
 }
 
-void ReplayRewind::applyRestored(const FrameMeta &m) {
+void ReplayRewind::startForward(int target) {
+  forward_target = target > last_frame ? target : -1;
+  forward_stalls = 0;
+}
+
+bool ReplayRewind::seek(int frames) {
+  if (!owner || frames == 0 || last_frame < 0 || !meta[START_SLOT].valid) return false;
+
+  // Restoring snapshot S and simulating one frame shows S + 1, so the earliest frame that can be shown is start + 1
+  const int start = meta[START_SLOT].game_frame;
+  const int target = (std::max)(position() + frames, start + 1);
+
+  if (target >= last_frame) {
+    // ahead of (or at) what has been simulated: just simulate there
+    startForward(target);
+    return forwardPending();
+  }
+
+  // Back: newest snapshot at or before target - 1, falling back to the round start
+  int keep = 0; // keyframes that stay (the chosen one and older)
+  int slot = START_SLOT;
+  for (int i = 0; i < key_count; ++i) {
+    if (meta[keySlot(i)].game_frame <= target - 1) {
+      slot = keySlot(i);
+      keep = key_count - i;
+      break;
+    }
+  }
+
+  const FrameMeta m = meta[slot];
+  if (!restoreSlot(slot, last_frame - m.game_frame)) {
+    disable(STR("Rollback did not restore the expected slot"));
+    return false;
+  }
+
   // put the replay readers back where they were at that frame
   for (int i = 0; i < replay_peer::COUNT; ++i) {
     replay_head head = m.heads[i]; // copy: FIELD setters take T&
     replay_peer::get(i)->ReadHead = head;
+    last_heads[i] = m.heads[i];
   }
 
-  // Anything newer than the restored frame is in the future now. For each ring, drop those entries and move its
-  // write position back to its newest remaining entry, so new saves continue from there (SaveBackup only does
-  // Current = (Current + 1) % Max; the stale slots get overwritten).
-  for (auto *ring : {&dense, &sparse}) {
-    int newest = -1;
-    for (int i = 0; i < ring->size; ++i) {
-      auto &e = ring->meta[i];
-      if (!e.valid) continue;
-      if (e.game_frame > m.game_frame) e.valid = false;
-      else if (newest < 0 || e.game_frame > ring->meta[newest].game_frame) newest = i;
-    }
-    if (newest >= 0) ring->instance->CurrentBackupDataIndex = newest;
-  }
+  // keyframes newer than the restored one are in the future now: drop them, re-simulating saves them again
+  for (int i = 0; i < key_count - keep; ++i) meta[keySlot(i)].valid = false;
+  key_head = keep > 0 ? slot - 1 : KEYFRAMES - 1;
+  key_count = keep;
 
   auto *engine = asw_engine::get();
   if (engine && engine->GameFrame != m.game_frame) {
     send<LogLevel::Warning>(STR("[rewind] GameFrame after restore is {}, expected {}\n"), engine->GameFrame, m.game_frame);
   }
   last_frame = m.game_frame;
-  // a rewind cancels a forward jump in progress
-  forward_remaining = 0;
-  forward_target = -1;
-}
-
-bool ReplayRewind::stepBack(int frames) {
-  if (!owner || frames <= 0 || last_frame < 0) return false;
-
-  // Restoring snapshot S and simulating one frame shows S + 1, so the ideal snapshot is current - frames - 1.
-  const int now = last_frame;
-  const int ideal = now - frames - 1;
-
-  // dense: exact frame, if it is still within the last DENSE_FRAMES
-  int dense_k = 0;
-  const auto &dense_cur = dense.meta[dense.current()];
-  if (dense_cur.valid && dense_cur.game_frame == now) {
-    for (int k = (std::min)(frames + 1, dense.size - 1); k >= 2; --k) {
-      const auto &m = dense.meta[dense.indexBack(k)];
-      if (m.valid && m.game_frame == now - k) {
-        dense_k = k;
-        break;
-      }
-    }
-  }
-  if (dense_k && now - dense_k == ideal) {
-    const auto m = dense.meta[dense.indexBack(dense_k)];
-    if (!dense.restore(dense_k, now - m.game_frame)) {
-      disable(STR("Rollback did not restore the expected slot"));
-      return false;
-    }
-    applyRestored(m);
-    return true;
-  }
-
-  // sparse: newest keyframe at or before the ideal frame; otherwise the oldest one (as far back as possible).
-  // k = 0 (the ring's current slot) can't be restored through Rollback(), skip it.
-  int sparse_k = 0;
-  int best = -1, oldest = -1;
-  for (int k = 1; k < sparse.size; ++k) {
-    const auto &m = sparse.meta[sparse.indexBack(k)];
-    if (!m.valid || m.game_frame > now - 2) continue;
-    if (m.game_frame <= ideal && (best < 0 || m.game_frame > sparse.meta[sparse.indexBack(best)].game_frame)) best = k;
-    if (oldest < 0 || m.game_frame < sparse.meta[sparse.indexBack(oldest)].game_frame) oldest = k;
-  }
-  sparse_k = best > 0 ? best : oldest;
-
-  // use the keyframe if it reaches the ideal frame, or reaches further back than the dense ring can
-  const bool use_sparse =
-      sparse_k > 0 && (best > 0 || dense_k == 0 || sparse.meta[sparse.indexBack(sparse_k)].game_frame < now - dense_k);
-  if (use_sparse) {
-    const auto m = sparse.meta[sparse.indexBack(sparse_k)];
-    if (!sparse.restore(sparse_k, now - m.game_frame)) {
-      disable(STR("Rollback did not restore the expected slot"));
-      return false;
-    }
-    applyRestored(m);
-    return true;
-  }
-  if (dense_k) {
-    const auto m = dense.meta[dense.indexBack(dense_k)];
-    if (!dense.restore(dense_k, now - m.game_frame)) {
-      disable(STR("Rollback did not restore the expected slot"));
-      return false;
-    }
-    applyRestored(m);
-    return true;
-  }
-
-  send<LogLevel::Verbose>(STR("[rewind] nothing to step back to\n"));
-  return false;
-}
-
-void ReplayRewind::requestForward(int frames) {
-  if (!owner || frames <= 0 || last_frame < 0) return;
-  forward_remaining = frames;
-  forward_target = last_frame + frames;
+  // A keyframe is close enough: land on it (one simulated frame draws it). Only the round-start fallback simulates
+  // up to the target, since it can be far from it.
+  startForward(slot == START_SLOT ? target : m.game_frame + 1);
+  return true;
 }
 
 void ReplayRewind::beginForwardTick(AREDGameState_Battle *GameState) {
   forward_saved.armed = false;
   auto *game = GameState->Rollback;
-  if (forward_remaining <= 0 || !game) return;
+  auto *replay = GameState->ReplayManager;
+  if (!forwardPending() || !game || !replay) return;
 
-  const int chunk = (std::min)(forward_remaining, FORWARD_CHUNK);
-  forward_remaining -= chunk;
-  if (chunk <= 1) return; // the tick's own frame covers it
+  // The whole distance runs in this one tick, so only the last frame is drawn. Progress is measured from GameFrame
+  // afterwards, not from what was requested.
+  const int frames = (std::min)(forward_target - last_frame, MAX_FORWARD_FRAMES);
+  forward_saved.armed = true;
+  forward_saved.frames = frames;
+  forward_saved.from_frame = last_frame;
+  forward_saved.started = std::chrono::steady_clock::now();
+  forward_saved.rollback_frame = game->RollbackFrame;
+  forward_saved.fast_update_finish = game->IsFastUpdateFinish;
+  forward_saved.remaining_fast_forward = game->RemainingFastForwardFrames;
+  forward_saved.play_scale = replay->PlayScale;
+
+  // At 2x/3x UpdateBattle overwrites the tick's frame count with 2 or 3 after adding RollBackFrame; run this tick at
+  // normal speed so the seek frames go through.
+  if (forward_saved.play_scale > 0) {
+    int normal = 0; // non-const: FIELD setters take T&
+    replay->PlayScale = normal;
+  }
 
   // UpdateBattle adds RollBackFrame to this tick's frame count when RollBackFrame > 0 && !IsFastUpdateFinish, then
   // sets IsFastUpdateFinish. Offline nothing else in the loop reads RollBackFrame, and UpdateOnPreTick (the only
   // place that would start a rollback from it) already ran this tick.
-  forward_saved.armed = true;
-  forward_saved.rollback_frame = game->RollbackFrame;
-  forward_saved.fast_update_finish = game->IsFastUpdateFinish;
-  forward_saved.remaining_fast_forward = game->RemainingFastForwardFrames;
-  game->RollbackFrame = chunk - 1;
-  game->IsFastUpdateFinish = false;
+  if (frames > 1) {
+    int extra = frames - 1; // non-const: FIELD setters take T&
+    game->RollbackFrame = extra;
+    game->IsFastUpdateFinish = false;
+  }
 }
 
 void ReplayRewind::endForwardTick(AREDGameState_Battle *GameState) {
   if (!forward_saved.armed) return;
   forward_saved.armed = false;
   auto *game = GameState->Rollback;
-  if (!game) return;
-  game->RollbackFrame = forward_saved.rollback_frame;
-  game->IsFastUpdateFinish = forward_saved.fast_update_finish;
-  game->RemainingFastForwardFrames = forward_saved.remaining_fast_forward;
-  game->IsFastUpdateDoing = false;
+  auto *replay = GameState->ReplayManager;
+  if (game) {
+    game->RollbackFrame = forward_saved.rollback_frame;
+    game->IsFastUpdateFinish = forward_saved.fast_update_finish;
+    game->RemainingFastForwardFrames = forward_saved.remaining_fast_forward;
+    game->IsFastUpdateDoing = false;
+  }
+  // put the replay speed back, unless the speed button changed it during the tick
+  if (replay && forward_saved.play_scale > 0 && replay->PlayScale == 0) replay->PlayScale = forward_saved.play_scale;
+
+  if (last_frame < 0) return; // the round reset during the tick; invalidate() already dropped the seek
+  const int advanced = last_frame - forward_saved.from_frame;
+  if (forward_saved.frames > 1) {
+    const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - forward_saved.started).count();
+    send<LogLevel::Verbose>(STR("[rewind] simulated {} of {} frames in one tick: {:.1f} ms\n"), advanced,
+                            forward_saved.frames, ms);
+  }
+  // the battle loop does not always run (outside BATTLE_STATE_BATTLE); give up instead of retrying forever
+  if (advanced > 0) forward_stalls = 0;
+  else if (++forward_stalls >= 3) {
+    send<LogLevel::Warning>(STR("[rewind] seek to frame {} made no progress, cancelled\n"), forward_target);
+    forward_target = -1;
+  }
 }

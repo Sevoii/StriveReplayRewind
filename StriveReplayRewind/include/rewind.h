@@ -2,17 +2,25 @@
 
 #include "arcsys.h"
 
+#include <chrono>
+
 /*
-  Replay rewind, proof of concept: jump back in a replay, paused or playing, up to 5 seconds.
+  Replay rewind: seek back and forward through a replay, paused or playing.
 
-  The mod owns BATTLE_CRollbackManager instances (asw_rollback::create_owned) and snapshots the battle into them,
-  together with the replay key-stream read heads. A snapshot is ~2.7 MB, so there are two tiers:
-    dense:  every frame for the last DENSE_FRAMES (single-frame steps)
-    sparse: one keyframe every SPARSE_INTERVAL frames, covering 5 s (longer jumps land on a keyframe)
+  The mod owns one BATTLE_CRollbackManager (asw_rollback::create_owned) and snapshots the battle into it, together
+  with the replay key-stream read heads. A snapshot is ~2.5-2.7 MB. Slots:
+    slot 0:       the first frame of the round, kept for the whole round
+    slots 1..30:  a ring of keyframes, one every KEYFRAME_INTERVAL frames (the last 30 s), oldest overwritten
 
-  Going back restores a snapshot from before the target and lets one frame simulate, so the engine draws that frame
-  with live visuals (and re-reads its replay inputs from the restored read heads). While playing, the same tick
-  simulates that frame anyway; while paused the caller lets one frame through.
+  Every seek ends by simulating forward:
+    back:    restore the newest keyframe before the target and drop every keyframe newer than it, then simulate one
+             frame to draw it (so a back seek lands up to KEYFRAME_INTERVAL frames before the target). If the ring
+             does not reach that far, restore the round start and fast-simulate up to the target instead; those
+             frames refill the ring.
+    forward: fast-simulate up to the target; keyframes are saved along the way like during normal playback.
+  Fast simulation goes through UpdateBattle's own multi-frame loop (the one netplay resimulation and replay
+  fast-forward use), with the whole distance in a single tick, so only the final frame is drawn. The replay speed is
+  held at normal for that tick (2x/3x would cap the loop). While paused the caller lets that tick through.
 
   Engine side effects: Rollback() runs the object manager's PreRollBack/PostRollBack, which use the GAME's rollback
   manager (red::btl::GetRollbackManager()) for particle/pawn/audio cleanup. For the duration of the restore its
@@ -21,25 +29,23 @@
 */
 class ReplayRewind {
 public:
-  static constexpr int DENSE_FRAMES = 30;                 // 0.5 s of every frame
-  static constexpr int SPARSE_INTERVAL = 30;              // keyframe every 0.5 s
-  static constexpr int SPARSE_SLOTS = 5 * 60 / SPARSE_INTERVAL + 1; // 5 s of keyframes
-  static constexpr int FORWARD_CHUNK = 30;                // frames simulated per tick while jumping forward
+  static constexpr int KEYFRAMES = 30;          // keyframe ring size
+  static constexpr int KEYFRAME_INTERVAL = 60;  // one keyframe per second
+  static constexpr int SLOTS = 1 + KEYFRAMES;   // + the round start
+  static constexpr int START_SLOT = 0;
+  static constexpr int MAX_FORWARD_FRAMES = 100 * 60; // frames simulated in one tick while seeking (a full round)
 
-  // drop the snapshot buffers (frees memory)
+  // drop the snapshot buffer (frees memory)
   void reset();
   // snapshots are only valid within one round
   void invalidate();
   // after each UpdateBattleSub in replay mode; saves when GameFrame advanced
   void afterUpdate(class AREDGameState_Battle *GameState);
-  // go back at least `frames` frames (or as far as the buffers allow). Returns true on success; while paused the
-  // caller must let one frame simulate to draw the target.
-  bool stepBack(int frames);
+  // Seek `frames` frames from the current position (negative = back), relative to where a seek in progress will
+  // end. Clamped to the round start. Returns true if a seek was started.
+  bool seek(int frames);
 
-  // Jump forward by fast-simulating `frames` frames over the next few ticks, FORWARD_CHUNK per tick, through
-  // UpdateBattle's own multi-frame loop (the one replay fast-forward uses; only the last frame is drawn).
-  void requestForward(int frames);
-  bool forwardPending() const { return forward_remaining > 0; }
+  bool forwardPending() const { return forward_target >= 0 && last_frame >= 0 && last_frame < forward_target; }
   // around orig_UpdateBattle on a tick that is allowed to simulate: arms the extra frames, then puts the game's
   // rollback manager fields back
   void beginForwardTick(AREDGameState_Battle *GameState);
@@ -52,35 +58,38 @@ private:
     replay_head heads[replay_peer::COUNT] = {};
   };
 
-  struct Ring {
-    asw_rollback *instance = nullptr;
-    FrameMeta *meta = nullptr;
-    int size = 0;
-
-    bool create(int slots);
-    void destroy();
-    void invalidate();
-    int current() const { return instance->CurrentBackupDataIndex; }
-    int indexBack(int k) const { return (current() + size - k) % size; }
-    bool save(const FrameMeta &m);
-    // restore the slot k entries back; `frames_back` is the real frame distance (for the engine's cleanup)
-    bool restore(int k, int frames_back);
-  };
-
-  bool ensureInstances(AREDGameState_Battle *GameState);
+  bool ensureInstance(AREDGameState_Battle *GameState);
   void disable(const wchar_t *reason);
-  void applyRestored(const FrameMeta &m);
+  bool saveSlot(int slot, const FrameMeta &m);
+  // restore one slot without disturbing the others; `frames_back` is the real frame distance (for the engine's cleanup)
+  bool restoreSlot(int slot, int frames_back);
 
-  Ring dense, sparse;
-  AREDGameState_Battle *owner = nullptr; // buffers are sized for this battle; rebuilt when it changes
+  // keyframe ring, chronological: i = 0 is the newest
+  int keySlot(int i) const { return 1 + (key_head - i + KEYFRAMES) % KEYFRAMES; }
+  int newestSavedFrame() const;
+  // where the replay will be once a seek in progress finishes
+  int position() const { return forwardPending() ? forward_target : last_frame; }
+  void startForward(int target);
+
+  asw_rollback *store = nullptr;
+  FrameMeta meta[SLOTS];
+  int key_head = KEYFRAMES - 1; // ring position of the newest keyframe
+  int key_count = 0;
+
+  AREDGameState_Battle *owner = nullptr; // the buffer is sized for this battle; rebuilt when it changes
   int last_frame = -1;
+  replay_head last_heads[replay_peer::COUNT] = {};
   bool disabled = false;
   int mismatch_logs = 0;
 
-  int forward_remaining = 0;
-  int forward_target = -1; // GameFrame the jump ends on; dense saves are skipped until the last DENSE_FRAMES
+  int forward_target = -1; // GameFrame the seek ends on
+  int forward_stalls = 0;  // forward ticks in a row that did not advance GameFrame
   struct {
     bool armed = false;
+    int frames = 0;
+    int from_frame = 0;
+    std::chrono::steady_clock::time_point started;
+    int play_scale = 0;
     int rollback_frame = 0;
     bool fast_update_finish = false;
     int remaining_fast_forward = 0;

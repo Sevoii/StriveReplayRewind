@@ -105,6 +105,7 @@ public:
   void save_backup(); // SaveBackup(): advance CurrentBackupDataIndex, snapshot the battle into that slot
   bool rollback();    // Rollback(): restore slot CurrentBackupDataIndex - RollbackFrame, invalidate newer slots
   bool slot_set(int index) const;
+  void set_slot_flag(int index, bool set); // write a slot's bSet (Rollback() clears it on slots it considers newer)
   // Kill cached particles / return cached effect pawns. Netplay calls these on the game's instance after resimulating,
   // to drop whatever the resimulation did not reclaim.
   void clear_psc_cache();

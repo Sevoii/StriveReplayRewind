@@ -84,56 +84,48 @@ ReplayRewind replay_rewind;
 /* Hooks */
 
 void hook_MatchStart(AREDGameState_Battle *GameState) {
-  // MatchStart fires several times while a replay loads; buffers are kept per battle (rebuilt when the GameState
-  // changes), only the snapshots are dropped here
   replay_rewind.invalidate();
-  // presses from before this battle (menus, loading) must not seek once it starts
   BindWatcherI::clearInputs();
 
   orig_MatchStart(GameState);
 }
 
-/*
-  Pausing is left entirely to the game's replay controls (CReplayManager). When the replay is paused and the mod
-  needs a frame simulated (to draw a rewound frame, or to run a forward-jump chunk), it sets the game's own
-  StepPlay flag after UpdateBattle, so the next tick advances exactly like pressing the replay step button.
-*/
+
 void hook_UpdateBattle(AREDGameState_Battle *GameState, float DeltaTime) {
   auto *replay = GameState->ReplayManager;
   if (!replay || !isReplayPlayback(GameState)) {
-    // not a replay: discard presses so they do not fire later in one
     BindWatcherI::clearInputs();
     orig_UpdateBattle(GameState, DeltaTime);
     return;
   }
 
-  // whether the engine simulates this tick; must be read before orig_UpdateBattle (ReplayManager::Update clears StepPlay)
   const bool simulating = !replay->holds_pause();
-
-  // this still runs while the engine is paused (the battle game state ticks when paused)
-  // Runs before orig_UpdateBattle: while playing, this tick simulates the target frame anyway; while paused, the
-  // target frame is drawn on the next tick through StepPlay.
-  const int seek = keybindings.takeSeek();
-  const bool rewound = seek < 0 && replay_rewind.stepBack(-seek);
-  if (seek > 0) replay_rewind.requestForward(seek);
 
   if (roundResetting()) replay_rewind.invalidate();
 
-  // forward-jump chunks only run on ticks that simulate; on held ticks the extra frames would be skipped
+  if (const int seek = keybindings.takeSeek()) replay_rewind.seek(seek);
+
   const bool forward_tick = simulating && replay_rewind.forwardPending();
   if (forward_tick) replay_rewind.beginForwardTick(GameState);
   orig_UpdateBattle(GameState, DeltaTime);
   if (forward_tick) replay_rewind.endForwardTick(GameState);
 
-  // Update() has run by now, so this StepPlay survives into the next tick's UpdatePauseState
-  if (replay->Pause && (rewound || replay_rewind.forwardPending())) replay->StepPlay = true;
+  if (replay->Pause && replay_rewind.forwardPending()) replay->StepPlay = true;
 }
 
 void hook_UpdateBattleSub(AREDGameState_Battle *GameState, float DeltaTime, bool bSkip) {
   orig_UpdateBattleSub(GameState, DeltaTime, bSkip);
 
+  if (!isReplayPlayback(GameState)) return;
+  // Checked after every simulated frame, not once per tick: a seek runs many frames in one tick, and each frame
+  // executes (and clears) the round events the previous one queued. A reset queued here only happens on the next
+  // frame, so this frame is still the old round: drop the snapshots and do not save it.
+  if (roundResetting()) {
+    replay_rewind.invalidate();
+    return;
+  }
   // snapshot every simulated replay frame (no-op when GameFrame did not advance)
-  if (isReplayPlayback(GameState)) replay_rewind.afterUpdate(GameState);
+  replay_rewind.afterUpdate(GameState);
 }
 
 /* Mod Definition */
@@ -149,7 +141,7 @@ public:
     ModName = STR("Strive Replay Rewind");
     ModVersion = STR("0.1");
     ModDescription = STR("Rewind and seek through replays.");
-    ModAuthors = STR("pbozai, Sevoi");
+    ModAuthors = STR("Sevoi");
 
     Output::send<LogLevel::Verbose>(STR("Strive Replay Rewind Started\n"));
   }
