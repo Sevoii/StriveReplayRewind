@@ -1,0 +1,7 @@
+These are instructions to manually install this mod
+
+1. When you unzip `Unverum Manual.zip`, you will see 2 folders: `Strive Frame Viewer` and `Dependencies`.
+2. Open Unverum and click `Add Mods`, `Open Mods Folder`
+3. Move `Strive Frame Viewer` folder into the opened file explorer
+4. Go to the main `Unverum` folder. You will see a folder called `Dependencies`
+5. Drag the `Dependencies` folder from (this) mod into the `Unverum` folder. Make sure the `ue4ss.dll` and `dwmapi.dll` are replaced!
