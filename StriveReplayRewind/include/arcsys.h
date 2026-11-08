@@ -73,6 +73,7 @@ public:
   FIELD(0xC40, class asw_scene*, Scene);
   FIELD(0xC50, class asw_state*, State);
   FIELD(0xC58, class asw_events*, Events);
+  FIELD(0xC70, class replay_manager*, ReplayManager); // TUniquePtr<red::btl::CReplayManager>
 
   FIELD(0xF24, bool, bNetworkBattle);
   // UpdatePauseState ends with PC->SetPause(pause || bPauseByFrameAdvantage). The game only writes this flag at
@@ -155,6 +156,22 @@ public:
   FIELD(0x20, int, OperationType);
 
   bool is_reading() const { return OperationType == OP_READ_ONCE || OperationType == OP_READ_LOOP; }
+};
+
+// red::btl::CReplayManager (battle_Replay.h, REPLAY_GG4 == 1), the game's replay pause / step / speed state.
+// Per tick: UpdateOnPreTick -> UpdatePauseState reads these to decide PC->SetPause, then UpdateBattle calls
+// Update(), which clears StepPlay first and sets it again on the step button. So a StepPlay written after
+// UpdateBattle returns lets exactly one frame through on the next tick, like pressing the replay step button.
+class replay_manager {
+public:
+  FIELD(0x0, bool, Pause);
+  FIELD(0x1, bool, StepPlay);
+  FIELD(0x8, int, PlayScale); // <0 slow, >0 fast
+  FIELD(0xC, int, SkipFrame); // slow motion: ticks left to hold before the next frame
+
+  // UpdatePauseState's replay branch: (m_Pause || m_SkipFrame > 0) && !m_StepPlay. Before Update() runs in
+  // UpdateBattle, StepPlay still holds the value UpdatePauseState saw, so this tells whether this tick simulates.
+  bool holds_pause() const { return (Pause || SkipFrame > 0) && !StepPlay; }
 };
 
 class player_block {

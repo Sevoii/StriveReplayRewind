@@ -8,6 +8,9 @@ set(CMAKE_CXX_STANDARD 23)
 set(${TARGET}_Sources
         "${CMAKE_CURRENT_SOURCE_DIR}/src/arcsys.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/bbscript.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/bind_watcher.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/dllmain.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/rewind.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/sigscan.cpp"
         )
 
