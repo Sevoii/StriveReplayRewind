@@ -47,51 +47,39 @@ bool roundResetting() {
   return false;
 }
 
+// Seek binds: each key jumps a fixed distance through the replay (negative = back). Distances are in frames (60/s).
+struct SeekBind {
+  int key;
+  int frames;
+};
+
 class Keybinds {
 public:
-  static const int BUTTON_COUNT = 3;
-
-  int REWIND_FRAME_BUTTON = VK_F6; // back one frame
-  int REWIND_SEEK_BUTTON = VK_F7;  // back REWIND_SEEK_FRAMES
-  int FORWARD_SEEK_BUTTON = VK_F8; // forward REWIND_SEEK_FRAMES
-
-  int buttons[BUTTON_COUNT] = {REWIND_FRAME_BUTTON, REWIND_SEEK_BUTTON, FORWARD_SEEK_BUTTON};
-
-  int getButtonIndex(int input) {
-    for (int i = 0; i < BUTTON_COUNT; i++) {
-      if (buttons[i] == input) return i;
-    }
-    return -1;
-  }
-
-  void setButtonState(int input, bool val) {
-    int index = getButtonIndex(input);
-    if (index != -1) buttonStates[index] = val;
-  }
-
-  bool getButtonState(int input) {
-    int index = getButtonIndex(input);
-    return index != -1 && buttonStates[index];
-  }
-
-  void resetButtons() {
-    for (int i = 0; i < BUTTON_COUNT; i++) buttonStates[i] = false;
-  }
+  static constexpr SeekBind binds[] = {
+      {'Q', -3 * 60}, // back 3 s
+      {'W', -1 * 60}, // back 1 s
+      {'E', 1 * 60},  // forward 1 s
+      {'R', 3 * 60},  // forward 3 s
+  };
+  static constexpr int BUTTON_COUNT = sizeof(binds) / sizeof(binds[0]);
 
   void loadButtons() {
-    for (int i = 0; i < BUTTON_COUNT; i++) BindWatcherI::addToFilter(buttons[i]);
+    for (const auto &bind : binds) BindWatcherI::addToFilter(bind.key);
   }
 
-  void checkBinds() {
-    for (const auto &input : BindWatcherI::getInputs(false)) setButtonState(input, true);
+  // Seek distance requested since the last call (the last bind pressed wins), 0 if none.
+  int takeSeek() {
+    int seek = 0;
+    for (const auto &input : BindWatcherI::getInputs(false)) {
+      for (const auto &bind : binds) {
+        if (bind.key == input) seek = bind.frames;
+      }
+    }
+    return seek;
   }
-
-private:
-  bool buttonStates[BUTTON_COUNT] = {};
 } keybindings;
 
 ReplayRewind replay_rewind;
-constexpr int REWIND_SEEK_FRAMES = 3 * 60; // fixed 3 s
 
 /* Hooks */
 
@@ -119,15 +107,11 @@ void hook_UpdateBattle(AREDGameState_Battle *GameState, float DeltaTime) {
   const bool simulating = !replay->holds_pause();
 
   // this still runs while the engine is paused (the battle game state ticks when paused)
-  keybindings.checkBinds();
   // Runs before orig_UpdateBattle: while playing, this tick simulates the target frame anyway; while paused, the
   // target frame is drawn on the next tick through StepPlay.
-  int rewind_frames = 0;
-  if (keybindings.getButtonState(keybindings.REWIND_FRAME_BUTTON)) rewind_frames = 1;
-  if (keybindings.getButtonState(keybindings.REWIND_SEEK_BUTTON)) rewind_frames = REWIND_SEEK_FRAMES;
-  const bool rewound = rewind_frames && replay_rewind.stepBack(rewind_frames);
-  if (keybindings.getButtonState(keybindings.FORWARD_SEEK_BUTTON)) replay_rewind.requestForward(REWIND_SEEK_FRAMES);
-  keybindings.resetButtons();
+  const int seek = keybindings.takeSeek();
+  const bool rewound = seek < 0 && replay_rewind.stepBack(-seek);
+  if (seek > 0) replay_rewind.requestForward(seek);
 
   if (roundResetting()) replay_rewind.invalidate();
 
