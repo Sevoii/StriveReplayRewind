@@ -54,3 +54,8 @@ Then you can run any of the package_*.ps1 or deploy_*.ps1 scripts in the same fo
     1. ```Output/Output/<build>/UE4SS/bin/UE4SS.dll``` to ```Win64/```
     2. ```Output/Output/<build>/bin/proxy/bin/dwmapi.dll``` to ```Win64/```
     3. ```Output/StriveReplayRewind/<build>/StriveReplayRewind.dll``` to ```Win64/Mods/StriveReplayRewind/dlls/```
+
+
+## AI Disclosure
+
+This project was made possible through the help of Generative AI. All generated code was manually reviewed and edited by a human developer. 
