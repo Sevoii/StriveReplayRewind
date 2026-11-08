@@ -87,6 +87,8 @@ void hook_MatchStart(AREDGameState_Battle *GameState) {
   // MatchStart fires several times while a replay loads; buffers are kept per battle (rebuilt when the GameState
   // changes), only the snapshots are dropped here
   replay_rewind.invalidate();
+  // presses from before this battle (menus, loading) must not seek once it starts
+  BindWatcherI::clearInputs();
 
   orig_MatchStart(GameState);
 }
@@ -99,6 +101,8 @@ void hook_MatchStart(AREDGameState_Battle *GameState) {
 void hook_UpdateBattle(AREDGameState_Battle *GameState, float DeltaTime) {
   auto *replay = GameState->ReplayManager;
   if (!replay || !isReplayPlayback(GameState)) {
+    // not a replay: discard presses so they do not fire later in one
+    BindWatcherI::clearInputs();
     orig_UpdateBattle(GameState, DeltaTime);
     return;
   }
