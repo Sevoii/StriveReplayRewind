@@ -73,6 +73,7 @@ public:
   FIELD(0xC40, class asw_scene*, Scene);
   FIELD(0xC50, class asw_state*, State);
   FIELD(0xC58, class asw_events*, Events);
+  FIELD(0xC60, class battle_bg_location*, BGLocation); // red::btl::GetBGLocation()
   FIELD(0xC70, class replay_manager*, ReplayManager); // TUniquePtr<red::btl::CReplayManager>
 
   FIELD(0xF24, bool, bNetworkBattle);
@@ -243,6 +244,14 @@ public:
 
   ARRAY_FIELD(0x8, event_info[10], events);
   FIELD(0xA8, unsigned long, event_count);
+};
+
+// BattleBGLocation: which stage box (area) the battle is in. Wall breaks move to another box; the stage blueprint
+// shows/loads that box's background from level events, which rollback snapshots do not cover (see stage_sync.h).
+// Offset from BattleBGLocation::ApplyRollbackData (RVA 0xBD99A0).
+class battle_bg_location {
+public:
+  FIELD(0xA8, int, BoxIndex);
 };
 
 class asw_inputs {

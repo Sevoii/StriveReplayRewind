@@ -1,4 +1,5 @@
 #include "rewind.h"
+#include "stage_sync.h"
 
 #include <DynamicOutput/Output.hpp>
 #include <UnrealDef.hpp>
@@ -80,6 +81,28 @@ void ReplayRewind::invalidate() {
   last_frame = -1;
   forward_target = -1;
   forward_stalls = 0;
+  wall_breaks = 0;
+  last_box = -1;
+}
+
+void ReplayRewind::trackWallBreaks(AREDGameState_Battle *GameState, int frame) {
+  const auto *bg = GameState->BGLocation;
+  if (!bg) return;
+  const int box = bg->BoxIndex;
+  if (last_box >= 0 && box != last_box) {
+    ++wall_breaks;
+    send<LogLevel::Verbose>(STR("[rewind] wall break at frame {}: box {} -> {}\n"), frame, last_box, box);
+  }
+  last_box = box;
+}
+
+void ReplayRewind::resyncStage(const FrameMeta &m) {
+  // the restored snapshot is from before a wall break that already played out on the stage
+  if (m.wall_breaks == wall_breaks) return;
+  // walk the blueprint into the restored box the way a wall break does
+  const int called = m.box >= 0 ? stage_sync::enterBox(m.box, true) : 0;
+  send<LogLevel::Verbose>(STR("[rewind] restore crosses {} wall break(s): stage re-entered box {} ({} blueprint calls)\n"),
+                          wall_breaks - m.wall_breaks, m.box, called);
 }
 
 void ReplayRewind::disable(const wchar_t *reason) {
@@ -126,9 +149,12 @@ void ReplayRewind::afterUpdate(AREDGameState_Battle *GameState) {
   const int frame = engine->GameFrame;
   if (frame == last_frame) return;      // paused / nothing simulated
   if (frame < last_frame) invalidate(); // went backwards without us (round reset); old snapshots are stale
+  trackWallBreaks(GameState, frame);
 
   FrameMeta next;
   next.game_frame = frame;
+  next.wall_breaks = wall_breaks;
+  next.box = last_box;
   int reading = 0;
   for (int i = 0; i < replay_peer::COUNT; ++i) {
     const auto *peer = replay_peer::get(i);
@@ -224,6 +250,9 @@ bool ReplayRewind::seek(int frames) {
     send<LogLevel::Warning>(STR("[rewind] GameFrame after restore is {}, expected {}\n"), engine->GameFrame, m.game_frame);
   }
   last_frame = m.game_frame;
+  resyncStage(m);
+  wall_breaks = m.wall_breaks;
+  last_box = m.box;
   // A keyframe is close enough: land on it (one simulated frame draws it). Only the round-start fallback simulates
   // up to the target, since it can be far from it.
   startForward(slot == START_SLOT ? target : m.game_frame + 1);

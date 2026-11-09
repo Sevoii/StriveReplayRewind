@@ -26,6 +26,10 @@
   manager (red::btl::GetRollbackManager()) for particle/pawn/audio cleanup. For the duration of the restore its
   RollbackFrame is set to the real distance, then its particle/pawn caches are cleared, as netplay does after a
   resimulation. Its snapshot slots and the replay key buffer are never written.
+
+  Wall breaks: the stage box (BattleBGLocation) is in the snapshot, but the stage blueprint's response to the break
+  (OnBoxMoveStart/OnBgChangeInBoxMove/OnBoxMoveEnd: background swap, loaded/visible assets) is not. A restore to a
+  snapshot from before a break that happened since replays those level events for the restored box (stage_sync).
 */
 class ReplayRewind {
 public:
@@ -55,6 +59,8 @@ private:
   struct FrameMeta {
     bool valid = false;
     int game_frame = 0;
+    int wall_breaks = 0; // wall breaks this round before this frame
+    int box = -1;        // stage box at this frame
     replay_head heads[replay_peer::COUNT] = {};
   };
 
@@ -81,6 +87,13 @@ private:
   replay_head last_heads[replay_peer::COUNT] = {};
   bool disabled = false;
   int mismatch_logs = 0;
+
+  // Wall breaks: the stage blueprint swaps background/assets per box from level events that snapshots do not hold,
+  // so a restore across a break has to make the stage re-sync itself to the restored box.
+  int wall_breaks = 0;
+  int last_box = -1;
+  void trackWallBreaks(AREDGameState_Battle *GameState, int frame);
+  void resyncStage(const FrameMeta &m);
 
   int forward_target = -1; // GameFrame the seek ends on
   int forward_stalls = 0;  // forward ticks in a row that did not advance GameFrame
